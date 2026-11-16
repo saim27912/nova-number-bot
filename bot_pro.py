@@ -1993,7 +1993,17 @@ def main():
     app.add_handler(CallbackQueryHandler(on_copy_number, pattern=r"^cpn:"))
 
     log.info("Bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    port = int(os.environ.get("PORT", "10000"))
+    if not render_url:
+        raise RuntimeError("RENDER_EXTERNAL_URL is missing")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path="telegram",
+        webhook_url=f"{render_url}/telegram",
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
