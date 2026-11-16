@@ -9,8 +9,9 @@ import asyncio
 import html
 import logging
 import os
-import sqlite3
 import time
+import threading
+from urllib.parse import urlparse, unquote
 
 import httpx
 from telegram import (
@@ -72,12 +73,12 @@ def Btn(text, callback_data=None, **kw):
 
 # ------------------------------------------------------------------ CONFIG
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-API_KEY = os.environ["AX_API_KEY"]
+API_KEY = ""  # Loaded securely from PostgreSQL settings
 ADMIN_IDS = [int(i) for i in os.environ.get("ADMIN_IDS", "").split(",") if i.strip()]
 SUPPORT = os.environ.get("SUPPORT_USERNAME", "@admin")
 OTP_GROUP_ID = int(os.environ["OTP_GROUP_ID"]) if os.environ.get("OTP_GROUP_ID") else None
 OTP_GROUP_URL = os.environ.get("OTP_GROUP_URL", "")
-BASE_URL = "https://axnumberserver.shop/number/api"
+BASE_URL = "https://miahsms.com/bot/api"
 POLL_INTERVAL, POLL_TIMEOUT = 5, 600
 
 DEFAULTS = {
@@ -97,39 +98,55 @@ log = logging.getLogger("otp-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------- DATABASE
-db = sqlite3.connect("bot.db", check_same_thread=False)
-db.row_factory = sqlite3.Row
+from pg_adapter import db
+
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(
-  id INTEGER PRIMARY KEY, name TEXT, balance REAL DEFAULT 0,
-  premium_until INTEGER DEFAULT 0, banned INTEGER DEFAULT 0,
-  otp_count INTEGER DEFAULT 0, joined INTEGER);
+  id BIGINT PRIMARY KEY, name TEXT, balance DOUBLE PRECISION DEFAULT 0,
+  premium_until BIGINT DEFAULT 0, banned INTEGER DEFAULT 0,
+  otp_count INTEGER DEFAULT 0, joined BIGINT);
 CREATE TABLE IF NOT EXISTS numbers(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, number TEXT, rid TEXT,
-  service TEXT, country TEXT, otp TEXT, status TEXT, created INTEGER);
+  id BIGSERIAL PRIMARY KEY, user_id BIGINT, number TEXT, rid TEXT,
+  service TEXT, country TEXT, otp TEXT, status TEXT, created BIGINT);
 CREATE TABLE IF NOT EXISTS withdrawals(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL,
-  method TEXT, status TEXT DEFAULT 'pending', created INTEGER);
+  id BIGSERIAL PRIMARY KEY, user_id BIGINT, amount DOUBLE PRECISION,
+  method TEXT, status TEXT DEFAULT 'pending', created BIGINT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """)
+
 for k, v in DEFAULTS.items():
-    db.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, v))
+    db.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT (key) DO NOTHING", (k, v))
 db.commit()
 
 
 def q(sql, args=(), one=False):
-    cur = db.execute(sql, args)
-    return cur.fetchone() if one else cur.fetchall()
+    with db.lock:
+        cur = db.execute(sql, args)
+        return cur.fetchone() if one else cur.fetchall()
 
 
 def x(sql, args=()):
-    cur = db.execute(sql, args)
-    db.commit()
-    return cur
+    with db.lock:
+        cur = db.execute(sql, args)
+        db.commit()
+        return cur
+
+
+def xid(sql, args=()):
+    with db.lock:
+        cur = db.execute(sql + " RETURNING id", args)
+        row = cur.fetchone()
+        db.commit()
+        return row["id"]
 
 
 def S(key):
     return q("SELECT value FROM settings WHERE key=?", (key,), one=True)["value"]
+
+
+def get_api_key():
+    row = q("SELECT value FROM settings WHERE key=?", ("api_key",), one=True)
+    return row["value"] if row else ""
 
 
 def now():
@@ -150,37 +167,61 @@ def mask(n: str) -> str:
 
 
 # --------------------------------------------------------------- API LAYER
-http: httpx.AsyncClient
+http = None
 
 
-async def api_get(path, params):
-    r = await http.get(f"{BASE_URL}/{path}", params=params)
+async def api_get(path, params=None):
+    headers = {"X-API-Key": get_api_key()}
+    r = await http.get(
+        f"{BASE_URL}/{path}",
+        params=params or {},
+        headers=headers
+    )
     r.raise_for_status()
     return r.json()
 
 
 async def fetch_ranges():
-    return await api_get("liveaccess", {"api_key": API_KEY})
+    return await api_get("liveaccess")
 
 
 async def allocate_number(rid):
-    """Try the RID without trailing XXX first, then exactly as listed."""
-    last = None
-    for cand in dict.fromkeys([rid.replace("X", ""), rid]):
-        r = await http.post(f"{BASE_URL}/getnumber", json={"api_key": API_KEY, "rid": cand})
-        if r.status_code == 200:
-            return r.json()
-        last = r
-    return {"status": "error", "http": last.status_code, "body": last.text[:300]}
+    r = await http.post(
+        f"{BASE_URL}/getnum",
+        json={"range": rid},
+        headers={"X-API-Key": get_api_key()}
+    )
+    raw = r.json()
+    meta = raw.get("meta", {})
+    data = raw.get("data") or {}
+
+    if r.status_code == 200 and meta.get("code") == 200 and data.get("full_number"):
+        number = str(data["full_number"]).replace("+", "")
+        return {
+            "status": "success",
+            "number": number,
+            "country": data.get("country", "Unknown")
+        }
+
+    return {"status": "error", "http": r.status_code, "body": raw}
 
 
 async def check_otp(number):
-    return await api_get("otp", {"number": number})
+    raw = await api_get("live-console", {"since": 0, "limit": 200})
+    items = _feed_items(raw)
+    target = str(number).replace("+", "").strip()
+
+    for item in items:
+        found = str(item.get("number", "")).replace("+", "").strip()
+        otp = str(item.get("otp", "") or "")
+        if found == target and otp:
+            return {"status": "success", "otp": otp, "number": target}
+
+    return {"status": "pending"}
 
 
 async def global_pool():
-    return await api_get("success_otp", {"api_key": API_KEY})
-
+    return await api_get("success-otp-info")
 
 def parse_ranges(raw) -> dict:
     """/liveaccess -> {service: [{rid, label}]} (data.services[].sid / ranges)"""
@@ -211,7 +252,7 @@ MENU = ReplyKeyboardMarkup(
 
 async def ensure_user(update: Update):
     u = update.effective_user
-    x("INSERT OR IGNORE INTO users(id,name,joined) VALUES(?,?,?)", (u.id, u.full_name, now()))
+    x("INSERT INTO users(id,name,joined) VALUES(?,?,?) ON CONFLICT (id) DO NOTHING", (u.id, u.full_name, now()))
     row = q("SELECT * FROM users WHERE id=?", (u.id,), one=True)
     if row["banned"]:
         if update.callback_query:
@@ -328,9 +369,9 @@ async def on_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if old and not old.done():
         old.cancel()
 
-    num_id = x("INSERT INTO numbers(user_id,number,rid,service,country,status,created) "
-               "VALUES(?,?,?,?,?,'waiting',?)",
-               (user["id"], number, rid, service, country, now())).lastrowid
+    num_id = xid("INSERT INTO numbers(user_id,number,rid,service,country,status,created) "
+                 "VALUES(?,?,?,?,?,'waiting',?)",
+                 (user["id"], number, rid, service, country, now()))
 
     header = (f"{BRAND}\n{LINE}\n✅ <b>NUMBER ASSIGNED</b>\n\n"
               f"📞 Number: <code>+{number}</code>\n"
@@ -520,8 +561,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(f"❌ Amount must be {mn:g} - {u['balance']:.2f}.")
 
     x("UPDATE users SET balance=balance-? WHERE id=?", (amount, u["id"]))
-    wid = x("INSERT INTO withdrawals(user_id,amount,method,created) VALUES(?,?,?,?)",
-            (u["id"], amount, method, now())).lastrowid
+    wid = xid("INSERT INTO withdrawals(user_id,amount,method,created) VALUES(?,?,?,?)",
+               (u["id"], amount, method, now()))
     await update.message.reply_text(f"✅ Request #{wid} submitted. Pending admin approval.")
     kb = Markup([[Btn("✅ Approve", callback_data=f"wd:ok:{wid}"),
                   Btn("❌ Reject", callback_data=f"wd:no:{wid}")]])
@@ -691,6 +732,7 @@ def admin_kb():
         [Btn("🗑 Delete Stock", callback_data="adm:delnum"), Btn("📨 Send OTP", callback_data="adm:sendotp")],
         [Btn("🔍 User Info", callback_data="adm:uinfo"), Btn("🧾 Recent OTPs", callback_data="adm:otps")],
         [Btn("⚙️ Settings", callback_data="adm:set")],
+        [Btn("🔑 API Key", callback_data="adm:apikey")],
     ])
 
 
@@ -766,6 +808,9 @@ async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state, prompt = ADMIN_PROMPTS[act]
         context.user_data["await"] = state
         await show(prompt)
+    elif act == "apikey":
+        context.user_data["await"] = "adm_api_key"
+        await show("🔑 <b>API Key Update</b>\nনতুন API Key পাঠাও। Key নিরাপদে সংরক্ষিত হবে; প্যানেলে দেখানো হবে না।")
     elif act == "set":
         if len(parts) == 2:
             rows = [[Btn(f"{k} = {S(k)}", callback_data=f"adm:set:{k}")] for k in DEFAULTS]
@@ -826,6 +871,13 @@ async def on_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply(f"✅ {uid} {word}." if n else "❌ User not found.")
         elif state in ("adm_addnum", "adm_delnum", "adm_sendotp", "adm_uinfo"):
             await admin_extra_input(update, context, state, text, reply)
+        elif state == "adm_api_key":
+            if not text:
+                await reply("❌ API Key খালি হতে পারবে না।")
+            else:
+                x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                  ("api_key", text))
+                await reply("✅ API Key PostgreSQL-এ নিরাপদে সংরক্ষিত হয়েছে।")
         elif state.startswith("adm_setval:"):
             key = state.split(":", 1)[1]
             if key not in ("currency", "premium_info"):
@@ -841,10 +893,10 @@ async def on_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================== MANUAL NUMBERS ================================
 db.executescript("""
 CREATE TABLE IF NOT EXISTS stock_groups(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT, country TEXT);
+  id BIGSERIAL PRIMARY KEY, service TEXT, country TEXT);
 CREATE TABLE IF NOT EXISTS stock(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, gid INTEGER, number TEXT,
-  status TEXT DEFAULT 'free', added INTEGER);
+  id BIGSERIAL PRIMARY KEY, gid BIGINT, number TEXT,
+  status TEXT DEFAULT 'free', added BIGINT);
 """)
 db.commit()
 
@@ -864,7 +916,8 @@ ADMIN_PROMPTS.update({
 
 def stock_text():
     rows = q("""SELECT g.service, g.country,
-                SUM(s.status='free') AS free, SUM(s.status='used') AS used
+                COUNT(s.id) FILTER (WHERE s.status='free') AS free,
+                COUNT(s.id) FILTER (WHERE s.status='used') AS used
                 FROM stock_groups g LEFT JOIN stock s ON s.gid=g.id
                 GROUP BY g.id ORDER BY g.service, g.country""")
     if not rows:
@@ -895,7 +948,7 @@ async def load_services():
     lower = {k.lower(): k for k in services}
     groups = q("""SELECT g.id, g.service, g.country, COUNT(s.id) AS n
                   FROM stock_groups g JOIN stock s ON s.gid=g.id AND s.status='free'
-                  GROUP BY g.id HAVING n>0 ORDER BY g.service, g.country""")
+                  GROUP BY g.id HAVING COUNT(s.id)>0 ORDER BY g.service, g.country""")
     for g in groups:
         name = lower.get(g["service"].lower(), g["service"])
         services.setdefault(name, []).insert(
@@ -931,8 +984,8 @@ async def admin_extra_input(update, context, state, text, reply):
         if not service or not country or not nums:
             raise ValueError
         g = q("SELECT id FROM stock_groups WHERE service=? AND country=?", (service, country), one=True)
-        gid = g["id"] if g else x("INSERT INTO stock_groups(service,country) VALUES(?,?)",
-                                  (service, country)).lastrowid
+        gid = g["id"] if g else xid("INSERT INTO stock_groups(service,country) VALUES(?,?)",
+                                      (service, country))
         added = 0
         for n in dict.fromkeys(nums):
             if q("SELECT 1 FROM stock WHERE number=? AND status='free'", (n,), one=True):
@@ -1220,7 +1273,7 @@ async def ensure_user(update):
 async def on_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     u = cq.from_user
-    x("INSERT OR IGNORE INTO users(id,name,joined) VALUES(?,?,?)", (u.id, u.full_name, now()))
+    x("INSERT INTO users(id,name,joined) VALUES(?,?,?) ON CONFLICT (id) DO NOTHING", (u.id, u.full_name, now()))
     _MEMBER_CACHE.pop(u.id, None)
     if not await is_group_member(context.bot, u.id, use_cache=False):
         return await cq.answer("❌ You have not joined the group yet.", show_alert=True)
@@ -1395,7 +1448,7 @@ async def live_ranges_loop(app):
             if not done:
                 m = await app.bot.send_message(OTP_GROUP_ID, text, reply_markup=kb,
                                                parse_mode=ParseMode.HTML)
-                x("INSERT OR REPLACE INTO settings(key,value) VALUES('live_msg_id',?)",
+                x("INSERT INTO settings(key,value) VALUES('live_msg_id',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
                   (str(m.message_id),))
                 try:
                     await app.bot.pin_chat_message(OTP_GROUP_ID, m.message_id,
@@ -1437,7 +1490,7 @@ def save_state(uid, service=None, rid=None):
     row = q("SELECT service, rid FROM user_state WHERE user_id=?", (uid,), one=True)
     svc = service if service is not None else (row["service"] if row else None)
     r = rid if rid is not None else (row["rid"] if row else None)
-    x("INSERT OR REPLACE INTO user_state(user_id,service,rid) VALUES(?,?,?)", (uid, svc, r))
+    x("INSERT INTO user_state(user_id,service,rid) VALUES(?,?,?) ON CONFLICT (user_id) DO UPDATE SET service=EXCLUDED.service, rid=EXCLUDED.rid", (uid, svc, r))
 
 
 async def restore_state(uid, context):
@@ -1848,8 +1901,8 @@ async def on_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = ud.get("service", "?")
     ids = {}
     for n, c in got:
-        ids[n] = x("INSERT INTO numbers(user_id,number,rid,service,country,status,created) "
-                   "VALUES(?,?,?,?,?,'waiting',?)", (user["id"], n, rid, service, c, now())).lastrowid
+        ids[n] = xid("INSERT INTO numbers(user_id,number,rid,service,country,status,created) "
+                      "VALUES(?,?,?,?,?,'waiting',?)", (user["id"], n, rid, service, c, now()))
     info = country_of(got[0][0]) if "country_of" in globals() else None
     title = (f"{info[1]} <b>{html.escape(info[2])} ({info[0]})</b> Allocated ✅" if info
              else f"🌍 <b>{html.escape(got[0][1])}</b> Allocated ✅")
@@ -1891,7 +1944,8 @@ async def post_shutdown(app: Application):
     lt = app.bot_data.get('live_task')
     if lt:
         lt.cancel()
-    await http.aclose()
+    if http is not None:
+        await http.aclose()
 
 
 def main():

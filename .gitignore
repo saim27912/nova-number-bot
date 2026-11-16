@@ -1,5 +1,9 @@
-bot.db
-*.db
 .env
-*.log
+*.db
+*.sqlite3
 __pycache__/
+*.pyc
+bot_pro_backup.py
+bot_pro_before_admin_api.py
+bot_pro_pre_pg*.py
+patch*.py
